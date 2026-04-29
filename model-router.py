@@ -9,6 +9,7 @@ from typing import Callable, Awaitable, Any, Optional, Literal
 import json
 import re
 import random
+import urllib.request
 from open_webui.utils.misc import get_last_user_message_item
 
 
@@ -90,15 +91,51 @@ class Filter:
                         total_weight += weight
 
                 if weighted_models:
-                    # Select model based on weights
-                    r = random.uniform(0, total_weight)
-                    cumulative = 0
-                    selected_model = weighted_models[0][0]
-                    for model_id, weight in weighted_models:
-                        cumulative += weight
-                        if r <= cumulative:
-                            selected_model = model_id
-                            break
+                    # Fetch model online/offline status from scrp-chat-status.json
+                    offline_models = None
+                    try:
+                        req = urllib.request.Request(
+                            "https://scrp-login.econ.cuhk.edu.hk/scrp-chat-status.json",
+                            headers={"User-Agent": "oi-model-router"},
+                        )
+                        with urllib.request.urlopen(req, timeout=5) as resp:
+                            status_data = json.loads(resp.read().decode())
+                            offline_models = {
+                                m["name"]
+                                for m in status_data.get("models", [])
+                                if m.get("status") == "offline"
+                            }
+                    except Exception:
+                        pass  # If fetch fails, treat all models as online (no filtering)
+
+                    # Filter out offline models; if a model is not in the status JSON, assume it is online
+                    if offline_models is not None:
+                        available_models = [
+                            (mid, w)
+                            for mid, w in weighted_models
+                            if mid not in offline_models
+                        ]
+                        # If all models are offline, fall back to the full list
+                        if not available_models:
+                            available_models = weighted_models
+                    else:
+                        available_models = weighted_models
+
+                    # Recalculate total weight from available models
+                    available_weight = sum(w for _, w in available_models)
+
+                    if available_weight > 0:
+                        # Select model based on weights
+                        r = random.uniform(0, available_weight)
+                        cumulative = 0
+                        selected_model = available_models[0][0]
+                        for model_id, weight in available_models:
+                            cumulative += weight
+                            if r <= cumulative:
+                                selected_model = model_id
+                                break
+                    else:
+                        selected_model = weighted_models[0][0]
 
                     # Skip routing if the same model is chosen (prevents infinite loops)
                     # but still allow Chinese and vision routing to apply
