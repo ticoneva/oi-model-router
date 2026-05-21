@@ -1,7 +1,7 @@
 """
 title: Model Router with Load Balancing
 author: ticoneva, open-webui, atgehrhardt,
-version: 0.2
+version: 0.3
 """
 
 from pydantic import BaseModel, Field
@@ -18,6 +18,18 @@ class Filter:
         priority: int = Field(
             default=0,
             description="Priority level for the filter operations.",
+        )
+        load_balancer_models: str = Field(
+            default="",
+            description="A list of model IDs for the load balancer, one per line. Format: 'model_id:weight' (e.g., 'gpt-oss-120b:3'). Default weight is 1 if not specified. Use weight 0 to designate a model as a backup — it will only be selected when all primary (weight > 0) models are offline.",
+        )
+        enable_chinese_routing: bool = Field(
+            default=False,
+            description="Enable or disable Chinese model routing.",
+        )
+        enable_vision_routing: bool = Field(
+            default=False,
+            description="Enable or disable vision model routing.",
         )
         vision_model_id: str = Field(
             default="",
@@ -43,18 +55,6 @@ class Filter:
             default=False,
             description="A flag to enable or disable the status indicator. Set to True to enable status updates.",
         )
-        load_balancer_models: str = Field(
-            default="",
-            description="A list of model IDs for the load balancer, one per line. Format: 'model_id:weight' (e.g., 'gpt-oss-120b:3'). Default weight is 1 if not specified. Use weight 0 to designate a model as a backup — it will only be selected when all primary (weight > 0) models are offline.",
-        )
-        enable_chinese_routing: bool = Field(
-            default=False,
-            description="Enable or disable Chinese model routing.",
-        )
-        enable_vision_routing: bool = Field(
-            default=False,
-            description="Enable or disable vision model routing.",
-        )
         pass
 
     def __init__(self):
@@ -70,7 +70,11 @@ class Filter:
     ) -> dict:
         # Load balancer: randomly assign base model to one of the specified models with weighted selection
         if self.valves.load_balancer_models.strip():
-            lines = [m.strip() for m in self.valves.load_balancer_models.strip().split("\n") if m.strip()]
+            lines = [
+                m.strip()
+                for m in self.valves.load_balancer_models.strip().split("\n")
+                if m.strip()
+            ]
             if lines:
                 # Parse model IDs and weights: "model_id:weight" or just "model_id" (default weight 1)
                 weighted_models = []
@@ -269,7 +273,9 @@ class Filter:
                     content = message.get("content", "")
                     if isinstance(content, list):
                         content = " ".join(
-                            p.get("text", "") for p in content if p.get("type") == "text"
+                            p.get("text", "")
+                            for p in content
+                            if p.get("type") == "text"
                         )
                     break
 
