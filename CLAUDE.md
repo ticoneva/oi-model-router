@@ -4,7 +4,7 @@ An Open WebUI filter that routes requests to different models based on content t
 
 ## Features
 
-1. **Load Balancer**: Randomly assigns requests to models specified in `load_balancer_models` (one per line). Format: `model_id:weight` (e.g., `gpt-oss-120b:3`). Default weight is 1. Selection chance = weight / total_weight. If the same model is chosen, routing is skipped to prevent loops.
+1. **Load Balancer**: Randomly assigns requests to models specified in `load_balancer_models` (one per line). Format: `model_id:weight` (e.g., `gpt-oss-120b:3`). Default weight is 1. Selection chance = weight / total_weight. Models with weight 0 are treated as backups — they are only selected when all primary (weight > 0) models are offline. If the same model is chosen, routing is skipped to prevent loops.
 
 2. **Vision Routing**: When enabled (`enable_vision_routing`), routes requests containing images to the vision model specified in `vision_model_id`.
 

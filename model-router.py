@@ -45,7 +45,7 @@ class Filter:
         )
         load_balancer_models: str = Field(
             default="",
-            description="A list of model IDs for the load balancer, one per line. Format: 'model_id:weight' (e.g., 'gpt-oss-120b:3'). Default weight is 1 if not specified.",
+            description="A list of model IDs for the load balancer, one per line. Format: 'model_id:weight' (e.g., 'gpt-oss-120b:3'). Default weight is 1 if not specified. Use weight 0 to designate a model as a backup — it will only be selected when all primary (weight > 0) models are offline.",
         )
         enable_chinese_routing: bool = Field(
             default=False,
@@ -91,6 +91,10 @@ class Filter:
                         total_weight += weight
 
                 if weighted_models:
+                    # Split into primary (weight > 0) and backup (weight == 0) models
+                    primary_models = [(mid, w) for mid, w in weighted_models if w > 0]
+                    backup_models = [(mid, w) for mid, w in weighted_models if w <= 0]
+
                     # Fetch model online/offline status from scrp-chat-status.json
                     offline_models = None
                     try:
@@ -110,26 +114,41 @@ class Filter:
 
                     # Filter out offline models; if a model is not in the status JSON, assume it is online
                     if offline_models is not None:
-                        available_models = [
+                        available_primary = [
                             (mid, w)
-                            for mid, w in weighted_models
+                            for mid, w in primary_models
+                            if mid not in offline_models
+                        ]
+                        available_backup = [
+                            (mid, w)
+                            for mid, w in backup_models
                             if mid not in offline_models
                         ]
                         # If all models are offline, fall back to the full list
-                        if not available_models:
-                            available_models = weighted_models
+                        if not available_primary and not available_backup:
+                            available_primary = primary_models
+                            available_backup = backup_models
                     else:
-                        available_models = weighted_models
+                        available_primary = primary_models
+                        available_backup = backup_models
 
-                    # Recalculate total weight from available models
-                    available_weight = sum(w for _, w in available_models)
+                    # Use primary models if any are available; otherwise fall back to backup models
+                    if available_primary:
+                        selection_pool = available_primary
+                    elif available_backup:
+                        # Backup models get equal weight since they were all weight 0
+                        selection_pool = [(mid, 1.0) for mid, _ in available_backup]
+                    else:
+                        selection_pool = weighted_models
+
+                    available_weight = sum(w for _, w in selection_pool)
 
                     if available_weight > 0:
                         # Select model based on weights
                         r = random.uniform(0, available_weight)
                         cumulative = 0
-                        selected_model = available_models[0][0]
-                        for model_id, weight in available_models:
+                        selected_model = selection_pool[0][0]
+                        for model_id, weight in selection_pool:
                             cumulative += weight
                             if r <= cumulative:
                                 selected_model = model_id
