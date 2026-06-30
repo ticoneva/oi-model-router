@@ -1,13 +1,15 @@
 """
 title: Model Router with Load Balancing
 author: ticoneva, open-webui, atgehrhardt,
-version: 0.4
+version: 0.5
 """
 
 from pydantic import BaseModel, Field
 from typing import Callable, Awaitable, Any, Optional, Literal
 import json
 import re
+import datetime
+from zoneinfo import ZoneInfo
 import random
 import urllib.request
 from open_webui.utils.misc import get_last_user_message_item
@@ -21,7 +23,7 @@ class Filter:
         )
         load_balancer_models: str = Field(
             default="",
-            description="A list of model IDs for the load balancer, one per line. Format: 'model_id:weight' (e.g., 'gpt-oss-120b:3'). Default weight is 1 if not specified. Use weight 0 to designate a model as a backup — it will only be selected when all primary (weight > 0) models are offline.",
+            description="A list of model IDs for the load balancer, one per line. Format: 'model_id:weight HH:MM-HH:MM' (e.g., 'gpt-oss-120b:3 09:00-17:00'). Both weight and time range are optional. Default weight is 1 if not specified. Use weight 0 to designate a model as a backup — it will only be selected when all primary (weight > 0) models are offline. Optional time range 'HH:MM-HH:MM' (24-hour, server local time) restricts when the model is eligible; overnight ranges like '22:00-06:00' cross midnight. End time is exclusive. Models with malformed or out-of-range time windows are skipped.",
         )
         enable_chinese_routing: bool = Field(
             default=False,
@@ -40,12 +42,16 @@ class Filter:
             description="The identifier of the Chinese model to be used for processing mainly Chinese text.",
         )
         enabled_for_admins: bool = Field(
-            default=False,
-            description="Whether dynamic vision routing is enabled for admin users.",
+            default=True,
+            description="Whether dynamic routing is enabled for admin users.",
         )
         enabled_for_users: bool = Field(
             default=True,
-            description="Whether dynamic vision routing is enabled for regular users.",
+            description="Whether dynamic routing is enabled for regular users.",
+        )
+        timezone_str: str = Field(
+            default="",
+            description="Timezone for time-range checks (e.g., 'Asia/Hong_Kong'). Empty string uses the server's local timezone.",
         )
         status: bool = Field(
             default=False,
@@ -182,6 +188,8 @@ class Filter:
                 return body          
 
         # Load balancer: randomly assign base model to one of the specified models with weighted selection
+        tz = ZoneInfo(self.valves.timezone_str) if self.valves.timezone_str else None
+        now = datetime.datetime.now(tz)
         if self.valves.load_balancer_models.strip():
             lines = [
                 m.strip()
@@ -189,20 +197,37 @@ class Filter:
                 if m.strip()
             ]
             if lines:
-                # Parse model IDs and weights: "model_id:weight" or just "model_id" (default weight 1)
+                # Parse model IDs, weights, and optional time ranges.
+                # Format per line: "model_id:weight HH:MM-HH:MM" (weight and time range are optional)
                 weighted_models = []
                 total_weight = 0
                 for line in lines:
-                    if ":" in line:
-                        parts = line.rsplit(":", 1)
-                        model_id = parts[0].strip()
+                    # Split model spec from optional time range on first whitespace
+                    parts = line.split(None, 1)
+                    model_spec = parts[0]
+                    time_range_str = parts[1].strip() if len(parts) > 1 else None
+
+                    # Parse model_id and weight from model_spec
+                    if ":" in model_spec:
+                        mparts = model_spec.rsplit(":", 1)
+                        model_id = mparts[0].strip()
                         try:
-                            weight = float(parts[1].strip())
+                            weight = float(mparts[1].strip())
                         except ValueError:
                             weight = 1.0
                     else:
-                        model_id = line
+                        model_id = model_spec
                         weight = 1.0
+
+                    # Parse and check time range; skip model if outside range or malformed
+                    if time_range_str:
+                        time_range = parse_time_range(time_range_str)
+                        if time_range is None:
+                            continue
+                        start_min, end_min = time_range
+                        if not is_within_time_range(start_min, end_min, now):
+                            continue
+
                     if model_id:
                         weighted_models.append((model_id, weight))
                         total_weight += weight
@@ -285,7 +310,7 @@ class Filter:
                 {
                     "type": "status",
                     "data": {
-                        "description": f"Load balancer routed to {final_model}",
+                        "description": f"Load balancer routed to {final_model} ({now.strftime('%H:%M')})",
                         "done": True,
                     },
                 }
@@ -293,7 +318,35 @@ class Filter:
 
         return body
 
-        
+
+def parse_time_range(s: str):
+    """Parse 'HH:MM-HH:MM' into (start_min, end_min) minutes-of-day, or None if invalid.
+
+    Rejects 'start == end' (e.g., '09:00-09:00') as ambiguous — likely a user error.
+    """
+    m = re.match(r"^(\d{2}):(\d{2})-(\d{2}):(\d{2})$", s.strip())
+    if not m:
+        return None
+    sh, sm, eh, em = int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
+    if not (0 <= sh <= 23 and 0 <= sm <= 59 and 0 <= eh <= 23 and 0 <= em <= 59):
+        return None
+    start_min, end_min = sh * 60 + sm, eh * 60 + em
+    if start_min == end_min:
+        return None
+    return (start_min, end_min)
+
+
+def is_within_time_range(start_min: int, end_min: int, now: datetime.datetime) -> bool:
+    """Check if now is within [start, end) (exclusive end).
+
+    Supports overnight ranges where start > end (e.g., 22:00-06:00 means
+    22:00 to 06:00 the next day).
+    """
+    now_min = now.hour * 60 + now.minute
+    if start_min < end_min:
+        return start_min <= now_min < end_min
+    # Overnight: start at 22:00, end at 06:00 -> available from 22:00 to 23:59 or 00:00 to 05:59
+    return now_min >= start_min or now_min < end_min
 
 
 def mostly_chinese(text: str) -> bool:
