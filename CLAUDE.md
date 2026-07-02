@@ -18,6 +18,8 @@ An Open WebUI filter that routes requests to different models based on content t
 - `load_balancer_models`: Model IDs for load balancing (one per line, format: `model_id:weight HH:MM-HH:MM`)
 - `enabled_for_admins`: Enable dynamic routing for admin users
 - `enabled_for_users`: Enable dynamic routing for regular users
+- `timezone_str`: Timezone for time-range checks (e.g., 'Asia/Hong_Kong')
+- `skip_online_check`: Skip fetching the online/offline status JSON and treat all models as online. Time ranges are still observed. (default: false)
 - `status`: Enable status indicator updates
 - `enable_chinese_routing`: Enable/disable Chinese model routing (default: false)
 - `enable_vision_routing`: Enable/disable vision model routing (default: false)

@@ -1,7 +1,7 @@
 """
 title: Model Router with Load Balancing
 author: ticoneva, open-webui, atgehrhardt,
-version: 0.5
+version: 0.6
 """
 
 from pydantic import BaseModel, Field
@@ -52,6 +52,10 @@ class Filter:
         timezone_str: str = Field(
             default="",
             description="Timezone for time-range checks (e.g., 'Asia/Hong_Kong'). Empty string uses the server's local timezone.",
+        )
+        skip_online_check: bool = Field(
+            default=False,
+            description="Skip fetching the online/offline status JSON and treat all models as online. Time ranges are still observed.",
         )
         status: bool = Field(
             default=False,
@@ -239,20 +243,21 @@ class Filter:
 
                     # Fetch model online/offline status from scrp-chat-status.json
                     offline_models = None
-                    try:
-                        req = urllib.request.Request(
-                            "https://scrp-login.econ.cuhk.edu.hk/scrp-chat-status.json",
-                            headers={"User-Agent": "oi-model-router"},
-                        )
-                        with urllib.request.urlopen(req, timeout=5) as resp:
-                            status_data = json.loads(resp.read().decode())
-                            offline_models = {
-                                m["name"]
-                                for m in status_data.get("models", [])
-                                if m.get("status") == "offline"
-                            }
-                    except Exception:
-                        pass  # If fetch fails, treat all models as online (no filtering)
+                    if not self.valves.skip_online_check:
+                        try:
+                            req = urllib.request.Request(
+                                "https://scrp-login.econ.cuhk.edu.hk/scrp-chat-status.json",
+                                headers={"User-Agent": "oi-model-router"},
+                            )
+                            with urllib.request.urlopen(req, timeout=5) as resp:
+                                status_data = json.loads(resp.read().decode())
+                                offline_models = {
+                                    m["name"]
+                                    for m in status_data.get("models", [])
+                                    if m.get("status") == "offline"
+                                }
+                        except Exception:
+                            pass  # If fetch fails, treat all models as online (no filtering)
 
                     # Filter out offline models; if a model is not in the status JSON, assume it is online
                     if offline_models is not None:
