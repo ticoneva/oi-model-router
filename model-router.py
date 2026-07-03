@@ -61,11 +61,11 @@ class Filter:
             description="Skip fetching the online/offline status JSON and treat all models as online. Time ranges are still observed.",
         )
         load_strategy: Literal["load_aware", "busy_exclude", "least_load"] = Field(
-            default="load_aware",
+            default="least_load",
             description="Load-based routing strategy applied when a model has a metrics URL. 'load_aware': scale static weight by 1/(1+load) so busier models get proportionally less traffic. 'busy_exclude': exclude models whose load exceeds load_busy_threshold (falls back to all if every model is busy). 'least_load': prefer the least-loaded model (static weight breaks ties). When no model has a metrics URL, all strategies degenerate to today's static weighted-random selection.",
         )
         load_metric: Literal["num_requests_waiting", "running_plus_waiting"] = Field(
-            default="num_requests_waiting",
+            default="running_plus_waiting",
             description="vLLM Prometheus metric used as the load signal. 'num_requests_waiting': queue depth — the direct congestion signal. 'running_plus_waiting': running + waiting requests, capturing overall engine busyness.",
         )
         load_busy_threshold: float = Field(
