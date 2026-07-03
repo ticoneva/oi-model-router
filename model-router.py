@@ -1,7 +1,7 @@
 """
 title: Model Router with Load Balancing
 author: ticoneva, open-webui, atgehrhardt,
-version: 0.6
+version: 0.7
 """
 
 from pydantic import BaseModel, Field
@@ -9,6 +9,9 @@ from typing import Callable, Awaitable, Any, Optional, Literal
 import json
 import re
 import datetime
+import math
+import time
+import concurrent.futures
 from zoneinfo import ZoneInfo
 import random
 import urllib.request
@@ -23,7 +26,7 @@ class Filter:
         )
         load_balancer_models: str = Field(
             default="",
-            description="A list of model IDs for the load balancer, one per line. Format: 'model_id:weight HH:MM-HH:MM' (e.g., 'gpt-oss-120b:3 09:00-17:00'). Both weight and time range are optional. Default weight is 1 if not specified. Use weight 0 to designate a model as a backup — it will only be selected when all primary (weight > 0) models are offline. Optional time range 'HH:MM-HH:MM' (24-hour, server local time) restricts when the model is eligible; overnight ranges like '22:00-06:00' cross midnight. End time is exclusive. Models with malformed or out-of-range time windows are skipped.",
+            description="A list of model IDs for the load balancer, one per line. Format: 'model_id:weight [metrics_url] [HH:MM-HH:MM]' — fields are whitespace-separated and order-free. The first token is always 'model_id:weight'; optional extra tokens are recognised by pattern: a URL (starts with 'http://' or 'https://') pointing at the model's vLLM /metrics endpoint for load-aware routing, and a time range 'HH:MM-HH:MM' (24-hour, server local time). Weight and both optional tokens may be omitted. Default weight is 1 if not specified. Use weight 0 to designate a model as a backup — it will only be selected when all primary (weight > 0) models are unavailable. Time ranges restrict when the model is eligible; overnight ranges like '22:00-06:00' cross midnight. End time is exclusive. Models with malformed or out-of-range time windows are skipped.",
         )
         enable_chinese_routing: bool = Field(
             default=False,
@@ -57,6 +60,22 @@ class Filter:
             default=False,
             description="Skip fetching the online/offline status JSON and treat all models as online. Time ranges are still observed.",
         )
+        load_strategy: Literal["load_aware", "busy_exclude", "least_load"] = Field(
+            default="load_aware",
+            description="Load-based routing strategy applied when a model has a metrics URL. 'load_aware': scale static weight by 1/(1+load) so busier models get proportionally less traffic. 'busy_exclude': exclude models whose load exceeds load_busy_threshold (falls back to all if every model is busy). 'least_load': prefer the least-loaded model (static weight breaks ties). When no model has a metrics URL, all strategies degenerate to today's static weighted-random selection.",
+        )
+        load_metric: Literal["num_requests_waiting", "running_plus_waiting"] = Field(
+            default="num_requests_waiting",
+            description="vLLM Prometheus metric used as the load signal. 'num_requests_waiting': queue depth — the direct congestion signal. 'running_plus_waiting': running + waiting requests, capturing overall engine busyness.",
+        )
+        load_busy_threshold: float = Field(
+            default=0.0,
+            description="Used by 'busy_exclude'. A model is treated as busy (excluded) when its load value is strictly greater than this threshold. Default 0.0 excludes any model with positive load; routing then falls back to all models if none are idle.",
+        )
+        metrics_cache_ttl: int = Field(
+            default=5,
+            description="Seconds to cache per-URL metrics values. Reduces calls to vLLM /metrics endpoints. A failed fetch is also cached for this duration to avoid retry storms against a down endpoint.",
+        )
         status: bool = Field(
             default=False,
             description="A flag to enable or disable the status indicator. Set to True to enable status updates.",
@@ -65,6 +84,8 @@ class Filter:
 
     def __init__(self):
         self.valves = self.Valves()
+        # url -> (load_value_or_None, fetch_time). None means a failed fetch.
+        self._metrics_cache: dict = {}
         pass
 
     async def inlet(
@@ -194,6 +215,7 @@ class Filter:
         # Load balancer: randomly assign base model to one of the specified models with weighted selection
         tz = ZoneInfo(self.valves.timezone_str) if self.valves.timezone_str else None
         now = datetime.datetime.now(tz)
+        used_load = None  # load value of the selected model, if a metrics URL was involved
         if self.valves.load_balancer_models.strip():
             lines = [
                 m.strip()
@@ -201,15 +223,24 @@ class Filter:
                 if m.strip()
             ]
             if lines:
-                # Parse model IDs, weights, and optional time ranges.
-                # Format per line: "model_id:weight HH:MM-HH:MM" (weight and time range are optional)
+                # Parse model IDs, weights, optional metrics URLs, and optional time ranges.
+                # Format per line: "model_id:weight [metrics_url] [HH:MM-HH:MM]"
+                # Fields after model_spec are whitespace-separated and order-free,
+                # classified by pattern: a URL (http(s)://...) and a time range (HH:MM-HH:MM).
+                time_range_re = re.compile(r"^\d{2}:\d{2}-\d{2}:\d{2}$")
                 weighted_models = []
                 total_weight = 0
                 for line in lines:
-                    # Split model spec from optional time range on first whitespace
-                    parts = line.split(None, 1)
-                    model_spec = parts[0]
-                    time_range_str = parts[1].strip() if len(parts) > 1 else None
+                    tokens = line.split()
+                    model_spec = tokens[0]
+                    metrics_url = None
+                    time_range_str = None
+                    for tok in tokens[1:]:
+                        if tok.startswith("http://") or tok.startswith("https://"):
+                            metrics_url = tok
+                        elif time_range_re.match(tok):
+                            time_range_str = tok
+                        # Unknown tokens are ignored
 
                     # Parse model_id and weight from model_spec
                     if ":" in model_spec:
@@ -233,13 +264,13 @@ class Filter:
                             continue
 
                     if model_id:
-                        weighted_models.append((model_id, weight))
+                        weighted_models.append((model_id, weight, metrics_url))
                         total_weight += weight
 
                 if weighted_models:
-                    # Split into primary (weight > 0) and backup (weight == 0) models
-                    primary_models = [(mid, w) for mid, w in weighted_models if w > 0]
-                    backup_models = [(mid, w) for mid, w in weighted_models if w <= 0]
+                    # Split into primary (weight > 0) and backup (weight <= 0) models
+                    primary_models = [(mid, w, url) for mid, w, url in weighted_models if w > 0]
+                    backup_models = [(mid, w, url) for mid, w, url in weighted_models if w <= 0]
 
                     # Fetch model online/offline status from scrp-chat-status.json
                     offline_models = None
@@ -262,13 +293,13 @@ class Filter:
                     # Filter out offline models; if a model is not in the status JSON, assume it is online
                     if offline_models is not None:
                         available_primary = [
-                            (mid, w)
-                            for mid, w in primary_models
+                            (mid, w, url)
+                            for mid, w, url in primary_models
                             if mid not in offline_models
                         ]
                         available_backup = [
-                            (mid, w)
-                            for mid, w in backup_models
+                            (mid, w, url)
+                            for mid, w, url in backup_models
                             if mid not in offline_models
                         ]
                         # If all models are offline, fall back to the full list
@@ -284,18 +315,109 @@ class Filter:
                         selection_pool = available_primary
                     elif available_backup:
                         # Backup models get equal weight since they were all weight 0
-                        selection_pool = [(mid, 1.0) for mid, _ in available_backup]
+                        selection_pool = [(mid, 1.0, url) for mid, _, url in available_backup]
                     else:
                         selection_pool = weighted_models
 
-                    available_weight = sum(w for _, w in selection_pool)
+                    # Resolve live load for any pool entry with a metrics URL.
+                    # Use a short-lived cache keyed by URL to avoid hammering /metrics
+                    # on every request; refresh stale/missing entries concurrently.
+                    ttl = self.valves.metrics_cache_ttl
+                    now_ts = time.monotonic()
+                    stale_urls = set()
+                    for _, _, url in selection_pool:
+                        if url and url not in self._metrics_cache:
+                            stale_urls.add(url)
+                        elif url:
+                            cached_val, cached_ts = self._metrics_cache[url]
+                            if cached_val is None or (now_ts - cached_ts) >= ttl:
+                                stale_urls.add(url)
+                    if stale_urls:
+                        urls = list(stale_urls)
+                        with concurrent.futures.ThreadPoolExecutor(
+                            max_workers=min(len(urls), 8)
+                        ) as ex:
+                            results = list(
+                                zip(
+                                    urls,
+                                    ex.map(
+                                        lambda u: fetch_model_load(
+                                            u, self.valves.load_metric, timeout=2.0
+                                        ),
+                                        urls,
+                                    ),
+                                )
+                            )
+                        for u, val in results:
+                            self._metrics_cache[u] = (val, now_ts)
+
+                    # Attach a resolved load to each pool entry: None when there is no
+                    # signal (no URL), None when the fetch failed, else a float >= 0.
+                    pool_with_load = []
+                    for mid, w, url in selection_pool:
+                        if url:
+                            cached_val, _ = self._metrics_cache.get(url, (None, now_ts))
+                            pool_with_load.append((mid, w, cached_val))
+                        else:
+                            pool_with_load.append((mid, w, None))
+
+                    # Gate 2: exclude models whose metrics fetch failed (a reachable model
+                    # with load 0 is kept; only a failed fetch excludes). Models without a
+                    # URL keep load None (no signal -> fail open, never excluded). If every
+                    # URL-bearing model failed, fall back to the whole pool with load 0 so
+                    # routing degrades to static weighting rather than failing outright.
+                    url_by_mid = {mid: url for mid, _, url in selection_pool}
+                    live_pool = [
+                        (mid, w, load)
+                        for mid, w, load in pool_with_load
+                        if not (url_by_mid.get(mid) is not None and load is None)
+                    ]
+                    if not live_pool:
+                        # Every URL-bearing model failed to fetch: keep the pool, load 0.
+                        live_pool = [(mid, w, 0.0) for mid, w, _ in pool_with_load]
+
+                    strategy = self.valves.load_strategy
+                    threshold = self.valves.load_busy_threshold
+
+                    # Build the (model_id, effective_weight) pairs to select from.
+                    # live_pool loads are None for no-URL models (no signal) or a float.
+                    if strategy == "load_aware":
+                        # effective_weight = W / (1 + load); no signal (None) treated as 0 -> W.
+                        eff_pool = [
+                            (mid, w / (1.0 + (load if load is not None else 0.0)))
+                            for mid, w, load in live_pool
+                        ]
+                    elif strategy == "busy_exclude":
+                        survivors = [
+                            (mid, w, load)
+                            for mid, w, load in live_pool
+                            if (load if load is not None else 0.0) <= threshold
+                        ]
+                        if not survivors:
+                            survivors = live_pool
+                        eff_pool = [(mid, w) for mid, w, _ in survivors]
+                    else:  # least_load
+                        # Prefer the least-loaded model; static weight breaks ties.
+                        # Models without a URL (no real load signal) are given the mean
+                        # of the observed loads so they neither always win nor always lose.
+                        observed = [load for _, _, load in live_pool if load is not None]
+                        synthetic = (sum(observed) / len(observed)) if observed else 0.0
+                        scored = [
+                            (mid, w, (load if load is not None else synthetic))
+                            for mid, w, load in live_pool
+                        ]
+                        min_load = min(s for _, _, s in scored)
+                        candidates = [(mid, w) for mid, w, s in scored if s == min_load]
+                        eff_pool = candidates
+
+                    available_weight = sum(w for _, w in eff_pool)
 
                     if available_weight > 0:
-                        # Select model based on weights
+                        # Select model based on (effective) weights
                         r = random.uniform(0, available_weight)
                         cumulative = 0
-                        selected_model = selection_pool[0][0]
-                        for model_id, weight in selection_pool:
+                        selected_model = eff_pool[0][0]
+                        for model_id, weight in eff_pool:
                             cumulative += weight
                             if r <= cumulative:
                                 selected_model = model_id
@@ -308,14 +430,27 @@ class Filter:
                     if selected_model != __model__["id"]:
                         body["model"] = selected_model
 
+                    # Track whether load data influenced this decision, for the status line.
+                    # Report only when the selected model actually had a metrics URL.
+                    if url_by_mid.get(selected_model) is not None:
+                        load_by_mid = {mid: load for mid, _, load in live_pool}
+                        used_load = load_by_mid.get(selected_model)
+
         final_model = body["model"]
 
         if self.valves.status:
+            if used_load is not None:
+                description = (
+                    f"Load balancer routed to {final_model} "
+                    f"(load={used_load}, strategy={self.valves.load_strategy}, {now.strftime('%H:%M')})"
+                )
+            else:
+                description = f"Load balancer routed to {final_model} ({now.strftime('%H:%M')})"
             await __event_emitter__(
                 {
                     "type": "status",
                     "data": {
-                        "description": f"Load balancer routed to {final_model} ({now.strftime('%H:%M')})",
+                        "description": description,
                         "done": True,
                     },
                 }
@@ -352,6 +487,58 @@ def is_within_time_range(start_min: int, end_min: int, now: datetime.datetime) -
         return start_min <= now_min < end_min
     # Overnight: start at 22:00, end at 06:00 -> available from 22:00 to 23:59 or 00:00 to 05:59
     return now_min >= start_min or now_min < end_min
+
+
+def parse_prometheus_metric(text: str, metric_name: str) -> float:
+    """Sum all sample values for metric_name across all label sets.
+
+    Anchors the metric name so that 'vllm:num_requests_waiting' does NOT match
+    'vllm:num_requests_waiting_by_reason' (which would double-count the queue).
+    A metric is matched only when immediately followed by '{...}' (labels) or
+    whitespace, then a number. Returns 0.0 if no samples match. Each value is
+    clamped to a minimum of 0; NaN/Inf values are treated as 0.
+    """
+    pattern = re.compile(
+        r"^" + re.escape(metric_name) + r"(?:\{[^}]*\})?\s+"
+        r"([-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)\s*$",
+        re.MULTILINE,
+    )
+    total = 0.0
+    for raw in pattern.findall(text):
+        try:
+            value = float(raw)
+        except ValueError:
+            continue
+        if math.isnan(value) or math.isinf(value):
+            value = 0.0
+        total += max(0.0, value)
+    return total
+
+
+def fetch_model_load(url: str, load_metric: str, timeout: float = 2.0) -> Optional[float]:
+    """Fetch url and return the load value per load_metric, or None on any error.
+
+    'num_requests_waiting' sums vllm:num_requests_waiting.
+    'running_plus_waiting' sums vllm:num_requests_running plus vllm:num_requests_waiting.
+
+    Returns None on network/timeout/HTTP/parse failure. A live endpoint that
+    returns no matching metric samples yields 0.0 (reachable and idle), not None.
+    """
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "oi-model-router"},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            text = resp.read().decode()
+
+        waiting = parse_prometheus_metric(text, "vllm:num_requests_waiting")
+        if load_metric == "running_plus_waiting":
+            running = parse_prometheus_metric(text, "vllm:num_requests_running")
+            return running + waiting
+        return waiting
+    except Exception:
+        return None
 
 
 def mostly_chinese(text: str) -> bool:
