@@ -14,6 +14,8 @@ An Open WebUI filter that routes requests to different models based on content t
 
    The `load_metric` valve selects the vLLM metric used as the load signal: `num_requests_waiting` (queue depth) or `running_plus_waiting` (running + waiting requests, default). Metric values are cached per URL for `metrics_cache_ttl` seconds (failed fetches are also cached, to avoid retry storms). A model whose metrics fetch fails is excluded unless every URL-bearing model fails, in which case routing degrades to static weighting. When no model has a metrics URL, all strategies reproduce today's static weighted-random selection.
 
+   **Sticky routing** (`sticky_routing`, default on): once the load balancer routes a user to a model, that model is remembered in Redis for `sticky_ttl_minutes` (default 5) and the user's subsequent requests stay on it, skipping load-based selection. A sticky target is reused only while it is still eligible (in the active time range and primary/backup pool) and not actually offline (per the status JSON). Busy models are deliberately kept — only true offline status breaks affinity, so a node under load still keeps its user. When the sticky target is unavailable or expired, routing falls back to normal selection and the new choice is recorded. Affinity is per user (not per session) and shared across Open WebUI instances via the `redis_url` store. Sticky state is namespaced: by default it uses the ID of the model calling the filter (the load-balancer base model), so each model family — which runs its own load-balancer copy — keeps an independent affinity; set `sticky_router_id` to share sticky tracking across instances.
+
 2. **Vision Routing**: When enabled (`enable_vision_routing`), routes requests containing images to the vision model specified in `vision_model_id`.
 
 3. **Chinese Routing**: When enabled (`enable_chinese_routing`), routes requests with mostly Chinese text to the Chinese model specified in `chinese_model_id`.
@@ -32,6 +34,10 @@ An Open WebUI filter that routes requests to different models based on content t
 - `load_metric`: vLLM metric used as the load signal — `num_requests_waiting` or `running_plus_waiting` (default).
 - `load_busy_threshold`: Load value above which a model is treated as busy under `busy_exclude`. (default: 0.0)
 - `metrics_cache_ttl`: Seconds to cache per-URL metric values, including failed fetches. (default: 5)
+- `sticky_routing`: Keep a user on the same load-balancer model they used within the last `sticky_ttl_minutes`, unless that model is actually offline. Busy models are still used. (default: true)
+- `sticky_ttl_minutes`: How long a user's last-routed load-balancer model is remembered for sticky routing. (default: 5)
+- `redis_url`: Redis URL for shared sticky-routing tracking. Only used when `sticky_routing` is enabled. (default: redis://redis-valkey:6379/0)
+- `sticky_router_id`: Optional namespace for sticky routing. If empty, the ID of the model calling the filter is used automatically, so each model family (which has its own load-balancer instance) keeps independent sticky state. Set the same ID on multiple router instances to share sticky tracking.
 - `status`: Enable status indicator updates
 - `enable_chinese_routing`: Enable/disable Chinese model routing (default: false)
 - `enable_vision_routing`: Enable/disable vision model routing (default: false)

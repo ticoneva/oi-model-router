@@ -1,7 +1,7 @@
 """
 title: Model Router with Load Balancing
 author: ticoneva, open-webui, atgehrhardt,
-version: 0.7
+version: 0.8
 """
 
 from pydantic import BaseModel, Field
@@ -76,6 +76,27 @@ class Filter:
             default=5,
             description="Seconds to cache per-URL metrics values. Reduces calls to vLLM /metrics endpoints. A failed fetch is also cached for this duration to avoid retry storms against a down endpoint.",
         )
+        sticky_routing: bool = Field(
+            default=True,
+            description="When enabled, a user's requests are routed to the same load-balancer model they used within the last sticky_ttl_minutes, unless that model is offline (busy models are still used). Falls back to normal selection otherwise.",
+        )
+        sticky_ttl_minutes: int = Field(
+            default=5,
+            description="How long a user's last-routed load-balancer model is remembered for sticky routing, in minutes.",
+        )
+        redis_url: str = Field(
+            default="redis://redis-valkey:6379/0",
+            description="Redis URL for shared sticky-routing tracking. Only used when sticky_routing is enabled.",
+        )
+        sticky_router_id: str = Field(
+            default="",
+            description=(
+                "Optional namespace for sticky routing. If empty, the ID of the model calling the filter "
+                "(the load-balancer base model) is used automatically, so each model family — which has its "
+                "own load-balancer instance — keeps an independent sticky state. Set the same ID on multiple "
+                "router instances to share sticky tracking across them."
+            ),
+        )
         status: bool = Field(
             default=False,
             description="A flag to enable or disable the status indicator. Set to True to enable status updates.",
@@ -86,7 +107,54 @@ class Filter:
         self.valves = self.Valves()
         # url -> (load_value_or_None, fetch_time). None means a failed fetch.
         self._metrics_cache: dict = {}
+        # Lazy-initialised Redis client for sticky routing (None = unavailable).
+        self._redis: Optional[Any] = None
         pass
+
+    def _get_redis(self) -> Optional[Any]:
+        """Return a shared Redis client, or None if Redis is unavailable.
+
+        Lazy-imported so the filter still loads when the redis package or the
+        Redis server is absent; sticky routing just degrades to normal selection.
+        """
+        if self._redis is not None:
+            return self._redis
+        try:
+            import redis as _redis
+
+            self._redis = _redis.from_url(self.valves.redis_url, decode_responses=True)
+            return self._redis
+        except Exception:
+            self._redis = None
+            return None
+
+    @staticmethod
+    def _sticky_key(namespace: str, user_id: str) -> str:
+        return f"oi-model-router:sticky:{namespace}:{user_id}"
+
+    def _get_sticky_model(self, namespace: str, user_id: str) -> Optional[str]:
+        """Return the user's last-routed model within the sticky window, or None."""
+        r = self._get_redis()
+        if r is None:
+            return None
+        try:
+            return r.get(self._sticky_key(namespace, user_id))
+        except Exception:
+            return None
+
+    def _set_sticky_model(self, namespace: str, user_id: str, model_id: str) -> None:
+        """Remember the routed model for the user, refreshing the TTL."""
+        r = self._get_redis()
+        if r is None:
+            return
+        try:
+            r.set(
+                self._sticky_key(namespace, user_id),
+                model_id,
+                ex=self.valves.sticky_ttl_minutes * 60,
+            )
+        except Exception:
+            pass
 
     async def inlet(
         self,
@@ -319,111 +387,155 @@ class Filter:
                     else:
                         selection_pool = weighted_models
 
-                    # Resolve live load for any pool entry with a metrics URL.
-                    # Use a short-lived cache keyed by URL to avoid hammering /metrics
-                    # on every request; refresh stale/missing entries concurrently.
-                    ttl = self.valves.metrics_cache_ttl
-                    now_ts = time.monotonic()
-                    stale_urls = set()
-                    for _, _, url in selection_pool:
-                        if url and url not in self._metrics_cache:
-                            stale_urls.add(url)
-                        elif url:
-                            cached_val, cached_ts = self._metrics_cache[url]
-                            if cached_val is None or (now_ts - cached_ts) >= ttl:
-                                stale_urls.add(url)
-                    if stale_urls:
-                        urls = list(stale_urls)
-                        with concurrent.futures.ThreadPoolExecutor(
-                            max_workers=min(len(urls), 8)
-                        ) as ex:
-                            results = list(
-                                zip(
-                                    urls,
-                                    ex.map(
-                                        lambda u: fetch_model_load(
-                                            u, self.valves.load_metric, timeout=2.0
-                                        ),
-                                        urls,
-                                    ),
-                                )
+                    # Sticky routing: if this user was routed to one of the
+                    # currently-eligible models within the sticky window, keep
+                    # them on it unless it is actually offline. Busy models are
+                    # deliberately NOT disqualified here — only true offline
+                    # status (from the status JSON) breaks stickiness. This
+                    # preserves the affinity even under load.
+                    #
+                    # The sticky state is namespaced: by default it uses the ID
+                    # of the model calling the filter (the load-balancer base
+                    # model), so each model family — which runs its own
+                    # load-balancer instance — keeps an independent affinity.
+                    # sticky_router_id lets an admin override this to share
+                    # sticky tracking across instances.
+                    calling_model_id = __model__["id"] if __model__ is not None else "default_model"
+                    sticky_namespace = self.valves.sticky_router_id.strip() or calling_model_id
+                    pool_ids = {mid for mid, _, _ in selection_pool}
+                    used_sticky = False
+                    if self.valves.sticky_routing and __user__ is not None:
+                        sticky_model = self._get_sticky_model(
+                            sticky_namespace, __user__["id"]
+                        )
+                        if (
+                            sticky_model
+                            and sticky_model in pool_ids
+                            and (
+                                offline_models is None
+                                or sticky_model not in offline_models
                             )
-                        for u, val in results:
-                            self._metrics_cache[u] = (val, now_ts)
+                        ):
+                            selected_model = sticky_model
+                            used_sticky = True
+                            # Refresh the sticky window so continued use keeps affinity.
+                            self._set_sticky_model(
+                                sticky_namespace, __user__["id"], sticky_model
+                            )
 
-                    # Attach a resolved load to each pool entry: None when there is no
-                    # signal (no URL), None when the fetch failed, else a float >= 0.
-                    pool_with_load = []
-                    for mid, w, url in selection_pool:
-                        if url:
-                            cached_val, _ = self._metrics_cache.get(url, (None, now_ts))
-                            pool_with_load.append((mid, w, cached_val))
-                        else:
-                            pool_with_load.append((mid, w, None))
+                    if not used_sticky:
+                        # Resolve live load for any pool entry with a metrics URL.
+                        # Use a short-lived cache keyed by URL to avoid hammering /metrics
+                        # on every request; refresh stale/missing entries concurrently.
+                        ttl = self.valves.metrics_cache_ttl
+                        now_ts = time.monotonic()
+                        stale_urls = set()
+                        for _, _, url in selection_pool:
+                            if url and url not in self._metrics_cache:
+                                stale_urls.add(url)
+                            elif url:
+                                cached_val, cached_ts = self._metrics_cache[url]
+                                if cached_val is None or (now_ts - cached_ts) >= ttl:
+                                    stale_urls.add(url)
+                        if stale_urls:
+                            urls = list(stale_urls)
+                            with concurrent.futures.ThreadPoolExecutor(
+                                max_workers=min(len(urls), 8)
+                            ) as ex:
+                                results = list(
+                                    zip(
+                                        urls,
+                                        ex.map(
+                                            lambda u: fetch_model_load(
+                                                u, self.valves.load_metric, timeout=2.0
+                                            ),
+                                            urls,
+                                        ),
+                                    )
+                                )
+                            for u, val in results:
+                                self._metrics_cache[u] = (val, now_ts)
 
-                    # Gate 2: exclude models whose metrics fetch failed (a reachable model
-                    # with load 0 is kept; only a failed fetch excludes). Models without a
-                    # URL keep load None (no signal -> fail open, never excluded). If every
-                    # URL-bearing model failed, fall back to the whole pool with load 0 so
-                    # routing degrades to static weighting rather than failing outright.
-                    url_by_mid = {mid: url for mid, _, url in selection_pool}
-                    live_pool = [
-                        (mid, w, load)
-                        for mid, w, load in pool_with_load
-                        if not (url_by_mid.get(mid) is not None and load is None)
-                    ]
-                    if not live_pool:
-                        # Every URL-bearing model failed to fetch: keep the pool, load 0.
-                        live_pool = [(mid, w, 0.0) for mid, w, _ in pool_with_load]
+                        # Attach a resolved load to each pool entry: None when there is no
+                        # signal (no URL), None when the fetch failed, else a float >= 0.
+                        pool_with_load = []
+                        for mid, w, url in selection_pool:
+                            if url:
+                                cached_val, _ = self._metrics_cache.get(url, (None, now_ts))
+                                pool_with_load.append((mid, w, cached_val))
+                            else:
+                                pool_with_load.append((mid, w, None))
 
-                    strategy = self.valves.load_strategy
-                    threshold = self.valves.load_busy_threshold
-
-                    # Build the (model_id, effective_weight) pairs to select from.
-                    # live_pool loads are None for no-URL models (no signal) or a float.
-                    if strategy == "load_aware":
-                        # effective_weight = W / (1 + load); no signal (None) treated as 0 -> W.
-                        eff_pool = [
-                            (mid, w / (1.0 + (load if load is not None else 0.0)))
-                            for mid, w, load in live_pool
-                        ]
-                    elif strategy == "busy_exclude":
-                        survivors = [
+                        # Gate 2: exclude models whose metrics fetch failed (a reachable model
+                        # with load 0 is kept; only a failed fetch excludes). Models without a
+                        # URL keep load None (no signal -> fail open, never excluded). If every
+                        # URL-bearing model failed, fall back to the whole pool with load 0 so
+                        # routing degrades to static weighting rather than failing outright.
+                        url_by_mid = {mid: url for mid, _, url in selection_pool}
+                        live_pool = [
                             (mid, w, load)
-                            for mid, w, load in live_pool
-                            if (load if load is not None else 0.0) <= threshold
+                            for mid, w, load in pool_with_load
+                            if not (url_by_mid.get(mid) is not None and load is None)
                         ]
-                        if not survivors:
-                            survivors = live_pool
-                        eff_pool = [(mid, w) for mid, w, _ in survivors]
-                    else:  # least_load
-                        # Prefer the least-loaded model; static weight breaks ties.
-                        # Models without a URL (no real load signal) are given the mean
-                        # of the observed loads so they neither always win nor always lose.
-                        observed = [load for _, _, load in live_pool if load is not None]
-                        synthetic = (sum(observed) / len(observed)) if observed else 0.0
-                        scored = [
-                            (mid, w, (load if load is not None else synthetic))
-                            for mid, w, load in live_pool
-                        ]
-                        min_load = min(s for _, _, s in scored)
-                        candidates = [(mid, w) for mid, w, s in scored if s == min_load]
-                        eff_pool = candidates
+                        if not live_pool:
+                            # Every URL-bearing model failed to fetch: keep the pool, load 0.
+                            live_pool = [(mid, w, 0.0) for mid, w, _ in pool_with_load]
 
-                    available_weight = sum(w for _, w in eff_pool)
+                        strategy = self.valves.load_strategy
+                        threshold = self.valves.load_busy_threshold
 
-                    if available_weight > 0:
-                        # Select model based on (effective) weights
-                        r = random.uniform(0, available_weight)
-                        cumulative = 0
-                        selected_model = eff_pool[0][0]
-                        for model_id, weight in eff_pool:
-                            cumulative += weight
-                            if r <= cumulative:
-                                selected_model = model_id
-                                break
-                    else:
-                        selected_model = weighted_models[0][0]
+                        # Build the (model_id, effective_weight) pairs to select from.
+                        # live_pool loads are None for no-URL models (no signal) or a float.
+                        if strategy == "load_aware":
+                            # effective_weight = W / (1 + load); no signal (None) treated as 0 -> W.
+                            eff_pool = [
+                                (mid, w / (1.0 + (load if load is not None else 0.0)))
+                                for mid, w, load in live_pool
+                            ]
+                        elif strategy == "busy_exclude":
+                            survivors = [
+                                (mid, w, load)
+                                for mid, w, load in live_pool
+                                if (load if load is not None else 0.0) <= threshold
+                            ]
+                            if not survivors:
+                                survivors = live_pool
+                            eff_pool = [(mid, w) for mid, w, _ in survivors]
+                        else:  # least_load
+                            # Prefer the least-loaded model; static weight breaks ties.
+                            # Models without a URL (no real load signal) are given the mean
+                            # of the observed loads so they neither always win nor always lose.
+                            observed = [load for _, _, load in live_pool if load is not None]
+                            synthetic = (sum(observed) / len(observed)) if observed else 0.0
+                            scored = [
+                                (mid, w, (load if load is not None else synthetic))
+                                for mid, w, load in live_pool
+                            ]
+                            min_load = min(s for _, _, s in scored)
+                            candidates = [(mid, w) for mid, w, s in scored if s == min_load]
+                            eff_pool = candidates
+
+                        available_weight = sum(w for _, w in eff_pool)
+
+                        if available_weight > 0:
+                            # Select model based on (effective) weights
+                            r = random.uniform(0, available_weight)
+                            cumulative = 0
+                            selected_model = eff_pool[0][0]
+                            for model_id, weight in eff_pool:
+                                cumulative += weight
+                                if r <= cumulative:
+                                    selected_model = model_id
+                                    break
+                        else:
+                            selected_model = weighted_models[0][0]
+
+                        # Record the freshly-selected model as the user's sticky
+                        # target so subsequent requests within the window stay on it.
+                        if self.valves.sticky_routing and __user__ is not None:
+                            self._set_sticky_model(
+                                sticky_namespace, __user__["id"], selected_model
+                            )
 
                     # Skip routing if the same model is chosen (prevents infinite loops)
                     # but still allow Chinese and vision routing to apply
@@ -431,8 +543,9 @@ class Filter:
                         body["model"] = selected_model
 
                     # Track whether load data influenced this decision, for the status line.
-                    # Report only when the selected model actually had a metrics URL.
-                    if url_by_mid.get(selected_model) is not None:
+                    # Report only when the selected model actually had a metrics URL; the
+                    # variables below are only populated on the non-sticky path.
+                    if not used_sticky and url_by_mid.get(selected_model) is not None:
                         load_by_mid = {mid: load for mid, _, load in live_pool}
                         used_load = load_by_mid.get(selected_model)
 
